@@ -98,4 +98,108 @@ async def demote_mod(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     chat_id = update.effective_chat.id
 
     try:
-        await context
+        await context.bot.promote_chat_member(
+            chat_id=chat_id,
+            user_id=target.id,
+            can_manage_chat=False,
+            can_delete_messages=False,
+            can_restrict_members=False,
+            can_pin_messages=False,
+            can_invite_users=False,
+            can_change_info=False,
+            can_manage_video_chats=False,
+            can_promote_members=False,
+        )
+        await update.message.reply_text(f"⬇️ Stripped admin permissions from **{target.full_name}**.", parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to demote: {e}")
+
+
+# --- REAL-TIME BAN & KICK MONITOR ---
+async def monitor_bans(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Watches every ban/kick and strips permissions if > 4 happen within 60 seconds."""
+    result: ChatMemberUpdated = update.chat_member
+    if not result:
+        return
+
+    old_status = result.old_chat_member.status
+    new_status = result.new_chat_member.status
+    actor = result.from_user  # The admin who executed the ban/kick
+
+    # Check if the action was a ban ("kicked") or a kick (member/restricted -> "left" triggered by someone else)
+    is_ban_or_kick = (
+        new_status == "kicked"
+        or (old_status in ("member", "restricted") and new_status == "left" and actor.id != result.new_chat_member.user.id)
+    )
+
+    if not is_ban_or_kick:
+        return
+
+    # Ignore bans done by the Group Owner or the Bot itself
+    if actor.id == OWNER_ID or actor.id == context.bot.id:
+        return
+
+    now = time.time()
+    # Filter list to only keep bans by this admin within the last 60 seconds
+    recent_bans = [t for t in ban_tracker[actor.id] if now - t < TIME_WINDOW]
+    recent_bans.append(now)
+    ban_tracker[actor.id] = recent_bans
+
+    # Trigger if they exceed 4 bans (i.e. on the 5th ban within 60 seconds)
+    if len(recent_bans) > MAX_BANS:
+        chat_id = result.chat.id
+        try:
+            await context.bot.promote_chat_member(
+                chat_id=chat_id,
+                user_id=actor.id,
+                can_manage_chat=False,
+                can_delete_messages=False,
+                can_restrict_members=False,
+                can_pin_messages=False,
+                can_invite_users=False,
+                can_change_info=False,
+                can_manage_video_chats=False,
+                can_promote_members=False,
+            )
+            ban_tracker[actor.id].clear()
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"🚨 **ADMIN ABUSE PREVENTED** 🚨\n\n"
+                    f"Admin **{actor.full_name}** (`{actor.id}`) banned/kicked more than "
+                    f"{MAX_BANS} members under 1 minute.\n"
+                    f"✅ **All admin permissions have been stripped automatically.**"
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"⚠️ **Alert:** Admin **{actor.full_name}** exceeded the ban limit, "
+                    f"but I couldn't demote them (`{e}`).\n"
+                    f"*Make sure they were promoted using `/promote` through me!*"
+                ),
+                parse_mode="Markdown",
+            )
+
+
+def main() -> None:
+    if not BOT_TOKEN or not OWNER_ID:
+        raise ValueError("Missing BOT_TOKEN or OWNER_ID in Environment Variables!")
+
+    # Start web server in background for Render free hosting
+    threading.Thread(target=run_health_server, daemon=True).start()
+
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("promote", promote_mod))
+    app.add_handler(CommandHandler("demote", demote_mod))
+    app.add_handler(ChatMemberHandler(monitor_bans, ChatMemberHandler.CHAT_MEMBER))
+
+    print("Guardian Bot is running...")
+    app.run_polling(allowed_updates=["message", "chat_member"], drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()
